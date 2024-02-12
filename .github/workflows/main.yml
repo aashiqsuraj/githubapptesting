@@ -1,0 +1,9 @@
+name: Build
+on: workflow_dispatch
+jobs:
+  Build:
+    name: Testing
+    runs-on: self-hosted
+    steps:
+      - name: Print console
+        run: Write-Host "Hello World"
