@@ -3,6 +3,7 @@
 //no jwt creating on the request coming other then github webhook AS EXPECTED
 //payload is getting updated in payload.txt
 //payload validation status is being written in validation.txt
+//JWT is also working "GREAT" checked it making a curl request
 
 package main
 
@@ -153,7 +154,7 @@ func generateJWTToken() (string, error) {
 	// Add claims to the token
 	claims := token.Claims.(jwt.MapClaims)
 	claims["iat"] = time.Now().Unix()
-	claims["exp"] = time.Now().Add(time.Hour * 24).Unix() // Token expiration time (e.g., 24 hours)
+	claims["exp"] = time.Now().Add(time.Minute * 9).Unix() // Token expiration time (e.g., 24 hours)
 	claims["iss"] = "827127"                              // Issuer claim
 	claims["alg"] = "RS256"                               // Algorithm used for signing
 
