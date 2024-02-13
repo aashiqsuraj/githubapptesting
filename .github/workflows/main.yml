@@ -4,6 +4,7 @@ jobs:
   Build:
     name: Testing
     runs-on: self-hosted
+    environment: Dev
     steps:
       - name: Print console
         run: Write-Host "Hello World"
