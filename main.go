@@ -1,176 +1,222 @@
-//this code is validating payload against "abcdefg" webhook secret
-//it creates JWT once payload is validated, and then JWT is written in jwt.txt
-//no jwt creating on the request coming other then github webhook AS EXPECTED
-//payload is getting updated in payload.txt
-//payload validation status is being written in validation.txt
-//JWT is also working "GREAT" checked it making a curl request
+//this code validates Payload coming from deployment webhook
+//creates JWT using pem key and installation id
+//obtains Access token write it in token.txt
+//fetches deployment url writes it in url.txt
+//get response from user at /response and accordingly runs or rejects workflow.
 
 package main
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
-	"io"
 	"io/ioutil"
-	"log"
 	"net/http"
-	"os"
 	"time"
 
 	"github.com/dgrijalva/jwt-go"
 )
 
 const (
-	webhookSecret = "abcdefg"
+	secretToken      = "abcdefg"
+	privateKeyPath   = "C:\\Users\\mishr\\Downloads\\demo-gha-app.2024-02-13.private-key.pem"
+	installationID   = 47252163
+	accessTokenURL   = "https://api.github.com/app/installations/47252163/access_tokens"
+	serverPort       = ":8080"
+	responseTemplate = `<html>
+<head>
+    <title>Response</title>
+</head>
+<body>
+    <h1>Response Page</h1>
+    <form action="/response" method="post">
+        <button type="submit" name="state" value="approved">Approved</button>
+        <button type="submit" name="state" value="rejected">Rejected</button>
+    </form>
+</body>
+</html>`
 )
 
-func main() {
-	http.HandleFunc("/", rootHandler)
-	http.HandleFunc("/webhook", webhookHandler)
-	http.HandleFunc("/approve", approveHandler)
-	http.HandleFunc("/reject", rejectHandler)
+var (
+	deploymentCallbackURL string
+	state                 string
+)
 
-	server := &http.Server{
-		Addr: ":8080",
-	}
-
-	fmt.Println("Server starting on http://localhost:8080")
-
-	err := server.ListenAndServe()
-	if err != nil {
-		log.Fatalf("Failed to start server: %v", err)
-	}
+type Payload struct {
+	DeploymentCallbackURL string `json:"deployment_callback_url"`
 }
 
-func rootHandler(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprintf(w, "Welcome to the Go application!")
+func main() {
+	http.HandleFunc("/webhook", webhookHandler)
+	http.HandleFunc("/response", responseHandler)
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "Hello, this is the webhook server!")
+	})
+	fmt.Printf("Server listening on %s\n", serverPort)
+	http.ListenAndServe(serverPort, nil)
 }
 
 func webhookHandler(w http.ResponseWriter, r *http.Request) {
-	// Log the request method and path
-	fmt.Printf("Received %s request at %s\n", r.Method, r.URL.Path)
-
-	// Verify the request is coming from GitHub
-	// GitHub sends a signature in the X-Hub-Signature header
+	// Validate payload
 	signature := r.Header.Get("X-Hub-Signature-256")
-	if signature == "" {
-		fmt.Println("Missing X-Hub-Signature-256 header")
-		http.Error(w, "Missing X-Hub-Signature-256 header", http.StatusBadRequest)
-		return
-	}
-
-	// Read and log the request body
-	body, err := io.ReadAll(r.Body)
+	payload, err := ioutil.ReadAll(r.Body)
 	if err != nil {
-		fmt.Println("Failed to read request body:", err)
-		http.Error(w, "Failed to read request body", http.StatusInternalServerError)
+		http.Error(w, "Error reading request body", http.StatusBadRequest)
 		return
 	}
-	defer r.Body.Close()
-
-	// Validate the incoming payload against the webhook secret
-	if !validatePayload(body, signature) {
-		fmt.Println("Payload validation failed")
-		writeValidationStatus("validation.txt", "Validation Failed")
-		http.Error(w, "Payload validation failed", http.StatusUnauthorized)
+	isValid := validatePayload(signature, payload)
+	if !isValid {
+		http.Error(w, "Invalid payload", http.StatusUnauthorized)
 		return
 	}
 
-	// Write payload to payload.txt
-	err = os.WriteFile("payload.txt", body, 0644)
+	// Write payload to file and extract deployment_callback_url
+	err = ioutil.WriteFile("payload.json", payload, 0644)
 	if err != nil {
-		fmt.Println("Failed to write payload to file:", err)
-		http.Error(w, "Failed to write payload to file", http.StatusInternalServerError)
+		http.Error(w, "Error writing payload to file", http.StatusInternalServerError)
 		return
 	}
-
-	fmt.Println("Payload validation successful")
-	writeValidationStatus("validation.txt", "Validation Successful")
-
-	// Generate JWT token
-	token, err := generateJWTToken()
+	var p Payload
+	err = json.Unmarshal(payload, &p)
 	if err != nil {
-		fmt.Println("Failed to generate JWT:", err)
-		http.Error(w, "Failed to generate JWT", http.StatusInternalServerError)
+		http.Error(w, "Error parsing payload", http.StatusInternalServerError)
 		return
 	}
-
-	// Log JWT token to jwt.txt
-	err = ioutil.WriteFile("jwt.txt", []byte(token), 0644)
+	deploymentCallbackURL = p.DeploymentCallbackURL
+	err = ioutil.WriteFile("URL.txt", []byte(deploymentCallbackURL), 0644)
 	if err != nil {
-		fmt.Println("Failed to write JWT to file:", err)
-		http.Error(w, "Failed to write JWT to file", http.StatusInternalServerError)
+		http.Error(w, "Error writing URL to file", http.StatusInternalServerError)
 		return
 	}
 
-	// Respond with JWT token
-	fmt.Fprintf(w, "JWT token: %s", token)
+	// Create JWT
+	jwtToken, err := createJWT()
+	if err != nil {
+		http.Error(w, "Error creating JWT", http.StatusInternalServerError)
+		return
+	}
+	err = ioutil.WriteFile("jwt.txt", []byte(jwtToken), 0644)
+	if err != nil {
+		http.Error(w, "Error writing JWT to file", http.StatusInternalServerError)
+		return
+	}
+
+	// Obtain Installation token
+	installationToken, err := getInstallationToken(jwtToken)
+	if err != nil {
+		http.Error(w, "Error obtaining Installation token", http.StatusInternalServerError)
+		return
+	}
+	err = ioutil.WriteFile("token.txt", []byte(installationToken), 0644)
+	if err != nil {
+		http.Error(w, "Error writing Installation token to file", http.StatusInternalServerError)
+		return
+	}
+
+	http.Redirect(w, r, "/response", http.StatusSeeOther)
 }
 
-func validatePayload(payload []byte, signature string) bool {
-	// Compute HMAC of the payload using the webhook secret
-	mac := hmac.New(sha256.New, []byte(webhookSecret))
+func responseHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method == "POST" {
+		state = r.FormValue("state")
+		if state != "approved" && state != "rejected" {
+			http.Error(w, "Invalid state", http.StatusBadRequest)
+			return
+		}
+
+		// Send POST request to GitHub API
+		accessToken, err := ioutil.ReadFile("token.txt")
+		if err != nil {
+			http.Error(w, "Error reading Installation token", http.StatusInternalServerError)
+			return
+		}
+		data := fmt.Sprintf(`{"environment_name":"Dev","state":"%s","comment":"All health checks passed."}`, state)
+		req, err := http.NewRequest("POST", deploymentCallbackURL, bytes.NewBuffer([]byte(data)))
+		if err != nil {
+			http.Error(w, "Error creating POST request", http.StatusInternalServerError)
+			return
+		}
+		req.Header.Set("Accept", "application/vnd.github+json")
+		req.Header.Set("Authorization", "Bearer "+string(accessToken))
+		req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+		client := &http.Client{}
+		resp, err := client.Do(req)
+		if err != nil {
+			http.Error(w, "Error sending POST request to GitHub API", http.StatusInternalServerError)
+			return
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			http.Error(w, "Unexpected status code from GitHub API", resp.StatusCode)
+			return
+		}
+
+		fmt.Fprintf(w, "POST request sent successfully with state: %s", state)
+	} else {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, responseTemplate)
+	}
+}
+
+func validatePayload(signature string, payload []byte) bool {
+	// Validate payload here using secret token and HMAC hex digest
+	key := []byte(secretToken)
+	mac := hmac.New(sha256.New, key)
 	mac.Write(payload)
 	expectedMAC := mac.Sum(nil)
-
-	// Convert the expected MAC to hex string
-	expectedSignature := "sha256=" + hex.EncodeToString(expectedMAC)
-
-	// Compare the computed signature with the received signature
-	return hmac.Equal([]byte(signature), []byte(expectedSignature))
+	expected := "sha256=" + hex.EncodeToString(expectedMAC)
+	return hmac.Equal([]byte(signature), []byte(expected))
 }
 
-func writeValidationStatus(filename, status string) {
-	file, err := os.Create(filename)
-	if err != nil {
-		fmt.Println("Failed to create validation status file:", err)
-		return
-	}
-	defer file.Close()
-
-	_, err = file.WriteString(status)
-	if err != nil {
-		fmt.Println("Failed to write validation status to file:", err)
-	}
-}
-
-func generateJWTToken() (string, error) {
-	// Load RSA private key from PEM file
-	keyData, err := ioutil.ReadFile("C:\\Users\\mishr\\Downloads\\demo-gha-app.2024-02-13.private-key.pem")
+func createJWT() (string, error) {
+	privateKeyBytes, err := ioutil.ReadFile(privateKeyPath)
 	if err != nil {
 		return "", err
 	}
 
-	privateKey, err := jwt.ParseRSAPrivateKeyFromPEM(keyData)
+	privateKey, err := jwt.ParseRSAPrivateKeyFromPEM(privateKeyBytes)
 	if err != nil {
 		return "", err
 	}
 
-	// Create a new token object
-	token := jwt.New(jwt.SigningMethodRS256)
+	now := time.Now()
+	token := jwt.NewWithClaims(jwt.SigningMethodRS256, jwt.MapClaims{
+		"iat": now.Unix(),
+		"exp": now.Add(10 * time.Minute).Unix(),
+		"iss": 827127,
+		"alg": "RS256",
+	})
 
-	// Add claims to the token
-	claims := token.Claims.(jwt.MapClaims)
-	claims["iat"] = time.Now().Unix()
-	claims["exp"] = time.Now().Add(time.Minute * 9).Unix() // Token expiration time (e.g., 24 hours)
-	claims["iss"] = "827127"                              // Issuer claim
-	claims["alg"] = "RS256"                               // Algorithm used for signing
+	return token.SignedString(privateKey)
+}
 
-	// Sign the token with the RSA private key
-	tokenString, err := token.SignedString(privateKey)
+func getInstallationToken(jwtToken string) (string, error) {
+	client := &http.Client{}
+	req, err := http.NewRequest("POST", accessTokenURL, nil)
 	if err != nil {
 		return "", err
 	}
-
-	return tokenString, nil
-}
-
-func approveHandler(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprintf(w, "Action: Approve")
-}
-
-func rejectHandler(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprintf(w, "Action: Reject")
+	req.Header.Set("Authorization", "Bearer "+jwtToken)
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	var result map[string]interface{}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return "", err
+	}
+	token, ok := result["token"].(string)
+	if !ok {
+		return "", fmt.Errorf("token not found in response")
+	}
+	return token, nil
 }
